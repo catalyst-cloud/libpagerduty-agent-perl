@@ -1,0 +1,630 @@
+package PagerDuty::Agent;
+
+use 5.010;
+use strict;
+use warnings;
+use Data::Dump 'dump';
+use Moo;
+use MooX::Types::MooseLike::Base qw/ ArrayRef Int Str /;
+
+our $VERSION = '0.02b';
+
+use English '-no_match_vars';
+use HTTP::Request::Common 'POST';
+use JSON;
+use LWP::UserAgent;
+use Sys::Hostname;
+use Time::Piece;
+use Time::HiRes qw/ time /;
+use HTTP::Status qw/ is_client_error /;
+
+=head1 NAME
+
+PagerDuty::Agent - A perl PagerDuty client
+
+=head1 VERSION
+
+Version 0.02
+
+=head1 SYNOPSIS
+
+  use PagerDuty::Agent;
+
+  my $agent = PagerDuty::Agent->new( routing_key => '3fcc9112463424b599f996f9e780dfc6' );
+
+  # trigger an event, then resolve it
+  my $dedup_key = $agent->trigger_event( 'something is terribly wrong!' );
+
+  if ( $dedup_key ) {
+    print "Event created, dedup_key = $dedup_key\n";
+
+    print "Event successfully resolved\n"
+      if $agent->resolve_event( $dedup_key );
+  } else {
+    warn "Failed to submit event: $@\n";
+  }
+
+  # additional context can be passed in
+  $agent->trigger_event(
+    summary   => 'something is terribly wrong!',
+    severity  => 'critical',
+    dedup_key => 'abc123',
+  );
+
+=head1 DESCRIPTION
+
+This module implements the Events API for submitting events to PagerDuty.
+
+=head1 CONSTRUCTOR
+
+=head2 my $agent = PagerDuty::Agent->new( %options )
+
+=over
+
+=item C<< routing_key => '3fcc9112463424b599f996f9e780dfc6' >>
+
+The routing key or integration key associated with the API integration, found when
+viewing the service integration on the PagerDuty site.
+
+=item C<< timeout => 5 >>
+
+Do not wait longer than this number of seconds when attempting to send an event.
+
+=item C<< api_version => 2 >>
+
+Only version 2 is supported.
+
+=item C<< spool => '/var/spool/pagerduty' >>
+
+PagerDuty may respond to a submission specifying that the the submission
+should be deferred and submitted again later. If spool is passed in, then
+submissions will be spooled there. They can later be resubmitted be
+calling the flush method.
+
+By default submissions aren't spooled.
+
+=back
+
+=cut
+
+has post_url => (
+    is       => 'ro',
+    isa      => Str,
+    required => 1,
+);
+
+has routing_key => (
+    is       => 'rw',
+    isa      => Str,
+);
+
+has api_version => (
+    is      => 'ro',
+    isa     => Int,
+    default => 2,
+);
+
+has timeout => (
+    is      => 'ro',
+    isa     => Int,
+    default => 5,
+);
+
+has spool => (
+    is  => 'ro',
+    isa => Str,
+);
+
+has json_serializer => (
+    is      => 'ro',
+    builder => '_build_json_serializer',
+    lazy    => 1,
+);
+
+has ua_obj => (
+    is      => 'ro',
+    builder => '_build_ua_obj',
+    lazy    => 1,
+);
+
+has valid_severities => (
+    is      => 'ro',
+    isa     => ArrayRef[Str],
+    default => sub { [qw/ critical error warning info /] },
+);
+
+around BUILDARGS => sub {
+    my ($orig, $class, %args) = @_;
+
+    my $spool = delete($args{spool});
+    die "spool directory doesn't exist: $spool"
+        if $spool && ! -d $spool;
+    die "spool directory not writable: $spool"
+        if $spool && ! -w $spool;
+
+    my $routing_key = delete($args{routing_key});
+    # If the spool dir is defined, we might be flushing the submissions,
+    # in which case the routing_key is in the json to submit.
+    if (! defined $spool && ! defined $routing_key) {
+        die "must pass routing_key\n";
+    };
+
+    delete($args{routing_key});
+
+    my $timeout = delete($args{timeout});
+
+    my $api_version = delete($args{api_version});
+    $api_version = 2 unless defined($api_version);
+
+    my $post_url = _post_url_for_version($api_version)
+        or die "invalid api version $api_version\n";
+
+    my $ua_obj = delete($args{ua_obj});
+
+    return $class->$orig(
+        (defined($routing_key) ? (routing_key => $routing_key) : ()),
+        post_url => $post_url,
+
+        (defined($api_version) ? (api_version => $api_version) : ()),
+        (defined($timeout) ? (timeout => $timeout) : ()),
+        (defined($ua_obj) ? (ua_obj => $ua_obj) : ()),
+        (defined($spool) ? (spool => $spool) : ()),
+    );
+};
+
+=head1 EVENT API
+
+These methods are designed to create and manipulate events.
+
+=head2 my $result = $agent->trigger_event( $event_summary or %event )
+
+Trigger an event.  The simple form accepts an $event_summary string with textual
+details of the event.  The long form accepts additional event context.
+
+=over
+
+=item * On success, returns the dedup_key.
+
+=item * On error, returns undef and sets $@.
+
+=item * On defer, returns string 'defer'.
+
+=back
+
+Event parameters when using the long form:
+
+=over
+
+=item C<< summary => 'Server is on fire' >>
+
+Required.  A textual description of the event.
+
+=item C<< class => 'cpu load' >>
+
+The type of event.
+
+=item C<< component => 'mysql' >>
+
+The mechanism responsible for the event.
+
+=item C<< custom_details => { user => 'me' } >>
+
+A hash-ref of key value pairs containing any additional details.
+
+=item C<< dedup_key => 'my unique identifier' >>
+
+This is used for threading like events as well as identifying events already triggered.
+If this is not given, one will be generated by the upstream API.
+
+=item C<< group => 'app-stack' >>
+
+The grouping of components.
+
+=item C<< images => [ { src => 'https://img.memecdn.com/silly-humans_o_842106.jpg' } ] >>
+
+One or more images, each specified as a hash-ref containing:
+
+=over
+
+=item C<< src => 'image url' >>
+
+Required.  Must be HTTPS.
+
+=item C<< href => 'link url' >>
+
+Make the image link click-able.
+
+=item C<< alt => 'some alt text' >>
+
+Add alt text to the image.
+
+=back
+
+=item C<< links => [ { text => 'see the docs', href => 'https://google.com' } ] >>
+
+One or more links, each specified as a hash-ref containing:
+
+=over
+
+=item C<< href => 'https://google.com' >>
+
+Required.  Link destination.
+
+=item C<< text => 'click here' >>
+
+Required.  Link text.
+
+=back
+
+=item C<< severity => 'error' >>
+
+The severity of the event.  Can be one of critical, error, warning, or info.  Defaults to error.
+
+=item C<< source => 'google.com' >>
+
+The hostname from which this event was triggered.  Defaults to the current hostname.
+
+=item C<< timestamp => '2017-07-12T12:50:22.000-0700' >>
+
+The event timestamp.  This must be a valid ISO 8601 in the complete long form such as the
+example.  This defaults to the current local time.
+
+
+=back
+
+=cut
+
+sub trigger_event {
+    my ($self, @params) = @_;
+
+    @params = (summary => $params[0])
+        if scalar(@params) == 1;
+
+    my $result;
+    eval {
+        $result = $self->_submit_event(
+            $self->_format_pd_cef('trigger', @params),
+        );
+    };
+    if ($@) {
+        warn $@;
+        $EVAL_ERROR = $@;
+    }
+    return $result;
+}
+
+=head2 my $result = $agent->acknowledge_event( $dedup_key or %event )
+
+Acknowledge an existing event.  The simple form accepts a $dedup_key.  The long
+form accepts the same event parameters as C<< trigger_event >> except C<< summary >>
+is interpreted as the reason for acknowledging and C<< dedup_key >> is required.
+
+=over
+
+=item * On success, returns the dedup_key.
+
+=item * On error, returns undef and sets $@.
+
+=item * On defer, returns string 'defer'.
+
+=back
+
+=cut
+
+sub acknowledge_event {
+    my ($self, @params) = @_;
+
+    @params = (summary => 'no reason given', dedup_key => $params[0])
+        if scalar(@params) == 1;
+
+    my $result;
+    eval {
+        $result =  $self->_submit_event(
+            $self->_format_pd_cef('acknowledge', @params),
+        );
+    };
+    if ($@) {
+        warn $@;
+        $EVAL_ERROR = $@;
+    }
+    return $result;
+}
+
+=head2 my $result = $agent->resolve_event( $dedup_key or %event )
+
+This accepts the same parameters as C<< acknowledge_event >> and returns the
+same values.
+
+=cut
+
+sub resolve_event {
+    my ($self, @params) = @_;
+
+    @params = (summary => 'no reason given', dedup_key => $params[0])
+        if scalar(@params) == 1;
+
+    my $result;
+    eval {
+        $result = $self->_submit_event(
+            $self->_format_pd_cef('resolve', @params),
+        );
+    };
+    if ($@) {
+        warn $@;
+        $EVAL_ERROR = $@;
+    }
+    return $result;
+}
+
+sub _submit_event {
+    my ($self, $event) = @_;
+
+    unless ($event) {
+        $EVAL_ERROR = "unable to parse event parameters";
+        warn "$EVAL_ERROR\n";
+        return;
+    }
+
+    my $json = $self->json_serializer()->encode($event);
+
+    my $result = $self->_post_event($json);
+
+    if (defined $result && $result eq 'defer') {
+        my $spool_file = $self->spool() . "/pd-" . time() . ".txt";
+
+        my $fd;
+        unless (open($fd, ">", $spool_file)) {
+            $EVAL_ERROR = "Failed to open $spool_file for writing: $!";
+            warn "$EVAL_ERROR\n";
+            return;
+        }
+
+        print $fd $json;
+        close($fd);
+    }
+
+    return $result;
+}
+
+=head2 my $result = $agent->flush()
+
+This accepts no parameters, if any submissions are spooled then they
+are submitted to PagerDuty in the order they were spooled.
+
+The result is a hash which returns a count of the results and the
+for each submission the dedup_key and status. For example:
+
+    $result = {
+        'dedup_keys' => [
+            [ '#38184', 'submitted' ],
+            [ '#38185', 'submitted' ],
+        ],
+        'count' => {
+            'errors' => 0,
+            'submitted' => 1,
+            'deferred' => 0
+        }
+    };
+
+=cut
+
+sub flush {
+    my ($self) = @_;
+
+    my $dh;
+    unless (opendir($dh, $self->spool())) {
+        die "Failed to open " . $self->spool() . " directory: $!";
+    }
+
+    my %status = (
+        count => {
+            deferred  => 0,
+            submitted => 0,
+            errors    => 0,
+        },
+        dedup_keys => [],
+    );
+    for my $file (sort readdir($dh)) {
+        ($file) = $file =~ /^(pd-\d+\.\d+.txt)$/;
+        next unless defined $file;
+        $file = $self->spool() . "/$file";
+
+        my ($result, $dedup_key) = $self->_submit_file($file);
+        if (defined $result) {
+            if ($result eq 'defer') {
+                $status{count}{deferred} += 1;
+
+                push @{ $status{dedup_keys} }, [$dedup_key, 'defer']
+                    if defined $dedup_key;
+            } else {
+                $status{count}{submitted} += 1;
+                push @{ $status{dedup_keys} }, [$result, 'submitted']
+            }
+        } else {
+            $status{count}{errors} += 1;
+
+            push @{ $status{dedup_keys} }, [$dedup_key, $@]
+                if defined $dedup_key;
+        }
+    }
+
+    close $dh;
+    return \%status;
+}
+
+sub _submit_file {
+    my ($self, $file) = @_;
+
+    my $fh;
+    unless (open($fh, "<", $file)) {
+        die "Failed to open $file: $!";
+    }
+
+    my $json = "";
+    while (<$fh>) {
+      $json .= $_;
+    }
+
+    close $fh;
+
+    if (! defined $self->routing_key()) {
+        $self->routing_key($self->json_serializer()->decode($json)->{routing_key});
+    }
+
+    my $result = $self->_post_event($json);
+    if (! defined $result || (defined $result && $result ne 'defer')) {
+        unlink $file;
+    }
+
+    # Peek inside the json just incase there is a dedup key we can return to
+    # people, but return it as second parameter so we don't break the API
+    # for the normal trigger/acknowledge/resolve methods.
+    return $result, $self->json_serializer()->decode($json)->{dedup_key};
+}
+
+sub _post_event {
+    my ($self, $json) = @_;
+
+    my ($response, $response_code, $response_content);
+    eval {
+        $self->ua_obj()->timeout($self->timeout());
+
+        my $request = POST(
+            $self->post_url(),
+            'Content-Type'  => 'application/json',
+            'Authorization' => 'Token token='.$self->routing_key(),
+            Content         => $json,
+        );
+        $response = $self->ua_obj()->request($request);
+
+        $response_code = $response->code();
+        $response_content = $response->content();
+    };
+
+    warn "$EVAL_ERROR\n" if $EVAL_ERROR;
+
+    if ($response && $response->is_success()) {
+        return $self->json_serializer()->decode($response_content)->{dedup_key};
+    } else {
+        if ($response) {
+            if ($self->spool()) {
+                if ($response->code == '429') {
+                    $EVAL_ERROR = "Submission of event to PagerDuty deferred to rate limiting. Response: " . $response->content;
+                    return 'defer';
+                } elsif (is_client_error($response->code)) {
+                    $EVAL_ERROR = "Submission of event to PagerDuty rejected. Response: " . $response->content;
+                    return;
+                } else {
+                    $EVAL_ERROR = "Submission of event to PagerDuty deferred due to network/server issue. Response: " . $response->content;
+                    return 'defer';
+                }
+            } else {
+                my $error_message;
+                eval {
+                    $error_message = dump(
+                        $self->json_serializer()->decode($response_content)
+                    );
+                };
+
+                $error_message = "Unable to parse response from PagerDuty: $EVAL_ERROR"
+                    if $EVAL_ERROR;
+
+                $EVAL_ERROR = $error_message;
+            }
+        }
+
+        return;
+    }
+}
+
+sub _validate_severity {
+    my ($self, $severity) = @_;
+
+    return unless defined($severity);
+
+    my %severity_hash = map { $_ => 1 } @{ $self->valid_severities() };
+
+    if (exists($severity_hash{$severity})) {
+        return $severity;
+    } else {
+        warn "unknown severity: $severity\n";
+        return;
+    }
+};
+
+sub _build_json_serializer { JSON->new()->utf8(1)->pretty(1)->allow_nonref(1) }
+
+sub _build_ua_obj {
+    return LWP::UserAgent->new(
+        keep_alive => 1,
+    );
+}
+
+sub _post_url_for_version {
+    my ($version) = @_;
+    return unless defined($version);
+    return {
+        2 => 'https://events.pagerduty.com/v2/enqueue',
+    }->{$version};
+}
+
+sub _trim {
+    my ($string, $length) = @_;
+    return defined($string)
+        ? substr($string, 0, $length)
+        : undef;
+}
+
+sub _format_pd_cef {
+    my ($self, $event_action, @params) = @_;
+
+    my %params;
+
+    if (scalar(@params) % 2 == 0) {
+        %params = @params;
+    } else {
+        return;
+    }
+
+    die "must set routing_key\n"
+        unless defined $self->routing_key();
+
+    $self->_validate_severity($params{severity})
+        if defined($params{severity});
+
+    return {
+        routing_key  => $self->routing_key(),
+        event_action => $event_action,
+        dedup_key    => $params{dedup_key},
+
+        images => $params{images},
+        links  => $params{links},
+
+        payload => {
+            summary        => $params{summary},
+            source         => $params{source}     || hostname(),
+            severity       => $params{severity}   || 'error',
+            timestamp      => $params{timestamp}  || localtime()->strftime('%FT%T.000%z'),
+            component      => $params{component},
+            group          => $params{group},
+            class          => $params{class},
+            custom_details => $params{custom_details},
+        },
+    };
+}
+
+=head1 See Also
+
+L<https://v2.developer.pagerduty.com/docs/events-api-v2> - The PagerDuty Events V2 API documentation
+
+L<WebService::PagerDuty> - Another module implementing most of the PagerDuty Events V1 API.
+
+=head1 LICENSE
+
+Copyright (C) 2019 by Matt Harrington
+
+The full text of this license can be found in the LICENSE file included with this module.
+
+=cut
+
+1;

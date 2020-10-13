@@ -1,0 +1,8 @@
+0.02b 2020-10-13 (Catalyst Cloud Ltd internal)
+ - Spool deferred submissions to disk.
+
+0.02 2019-06-29
+ - Improving documentation around error handling
+
+0.01 2017-07-12
+ - Initial release
