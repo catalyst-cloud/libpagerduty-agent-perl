@@ -15,7 +15,9 @@ Testsuite: autopkgtest-pkg-perl
 
 Package: libpagerduty-agent-perl
 Architecture: all
-Depends: ${misc:Depends}, ${perl:Depends}
+Depends: ${misc:Depends}, ${perl:Depends},
+  libmoox-types-mooselike-perl,
+  libdata-dump-perl
 Description: perl PagerDuty client
  PagerDuty::Agent implements the Events API for submitting events to
  PagerDuty and updating them.
