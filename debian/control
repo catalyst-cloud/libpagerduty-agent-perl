@@ -1,0 +1,21 @@
+Source: libpagerduty-agent-perl
+Section: perl
+Priority: optional
+Maintainer: Debian Perl Group <pkg-perl-maintainers@lists.alioth.debian.org>
+Uploaders: Debian <andrew@etc.gen.nz>
+Build-Depends: debhelper (>= 11)
+Build-Depends-Indep: perl
+Standards-Version: 4.3.0
+Vcs-Browser: https://salsa.debian.org/perl-team/modules/packages/libpagerduty-agent-perl
+Vcs-Git: https://salsa.debian.org/perl-team/modules/packages/libpagerduty-agent-perl.git
+Homepage: https://metacpan.org/release/PagerDuty-Agent
+Testsuite: autopkgtest-pkg-perl
+
+Package: libpagerduty-agent-perl
+Architecture: all
+Depends: ${misc:Depends}, ${perl:Depends}
+Description: perl PagerDuty client
+ PagerDuty::Agent implements the Events API for submitting events to
+ PagerDuty.
+ .
+ This description was automagically extracted from the module by dh-make-perl.
